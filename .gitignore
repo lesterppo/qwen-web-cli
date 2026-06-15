@@ -1,0 +1,20 @@
+# Qwen auth tokens
+auth.json
+*.token
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Playwright browser profiles
+browser-profile/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
