@@ -2,22 +2,23 @@
 """
 CLI for Qwen Chat (chat.qwen.ai) via Playwright browser automation.
 
+Features:
+  - Text prompts, multi-turn conversations
+  - Image upload for analysis (--image)
+  - Image generation extraction (--extract-images)
+  - Model selection (qwen3.7-plus, qwen3-max, qwen3-coder)
+  - JS-based DOM extraction, progress markers, persistent browser
+
 Qwen uses Alibaba WAF + JS/WASM request signing that blocks direct HTTP.
 Instead, we launch headless Chromium, type into the chat UI, and extract
 the response from the DOM. Auth via browser cookies (Firefox/Chrome/Edge).
 
 Usage:
-  python qwen.py -l                    # login via browser, capture cookies
-  python qwen.py "Hello"               # text prompt
-  python qwen.py -m qwen3-max "prompt" # model selection
-  python qwen.py -c chat.json "msg"    # multi-turn conversation
-  python qwen.py -o result.md "prompt" # write to file (agent-optimized)
-  python qwen.py --json "prompt"       # JSON output
-  echo "prompt" | python qwen.py       # stdin
-
-Auth:
-  - Login: python qwen.py -l (opens browser, saves cookies to ~/.qwen-cli/auth.json)
-  - Manual: export QWEN_TOKEN=<jwt> QWEN_COOKIE_HEADER="token=...; lswusea=..."
+  python qwen.py "Hello"
+  python qwen.py -m qwen3-max "Complex task"
+  python qwen.py --image photo.jpg "Describe this image"
+  python qwen.py --extract-images /tmp/imgs "Generate a cat picture"
+  python qwen.py -c chat.json "Multi-turn message"
 """
 
 import os
@@ -27,6 +28,7 @@ import time
 import argparse
 import re
 import textwrap
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,14 +45,15 @@ def fail(code: str, reason: str):
     sys.exit(1)
 
 def log(msg: str):
-    if not sys.stdout.isatty():  # auto-quiet when piped
-        return
-    print(f"[qwen] {msg}", file=sys.stderr)
+    print(msg, file=sys.stderr, flush=True)
+
+def info(msg: str):
+    if sys.stderr.isatty():
+        print(f"[qwen] {msg}", file=sys.stderr)
 
 # ── auth ─────────────────────────────────────────────────
 
 def read_auth():
-    """Read saved auth from ~/.qwen-cli/auth.json"""
     if QWEN_AUTH_FILE.exists():
         try:
             return json.loads(QWEN_AUTH_FILE.read_text())
@@ -62,8 +65,8 @@ def write_auth(data: dict):
     QWEN_HOME.mkdir(parents=True, exist_ok=True)
     QWEN_AUTH_FILE.write_text(json.dumps(data, indent=2))
 
+
 def extract_cookies_from_browser():
-    """Try to extract Qwen cookies from browser via browser_cookie3."""
     try:
         import browser_cookie3
         browsers = [
@@ -74,9 +77,7 @@ def extract_cookies_from_browser():
         for name, fetch_func in browsers:
             try:
                 cj = fetch_func(domain_name=".qwen.ai")
-                token = None
-                lswusea = None
-                cnaui = None
+                token = lswusea = cnaui = None
                 for c in cj:
                     if c.name == "token":
                         token = c.value
@@ -85,14 +86,13 @@ def extract_cookies_from_browser():
                     elif c.name == "cnaui":
                         cnaui = c.value
                 if token:
-                    log(f"Cookies extracted from {name}")
+                    info(f"Cookies extracted from {name}")
                     return {"token": token, "lswusea": lswusea, "cnaui": cnaui}
             except Exception:
                 continue
     except ImportError:
         pass
 
-    # WSL fallback: read Firefox cookies.sqlite directly from Windows filesystem
     if sys.platform == "linux":
         result = _extract_firefox_wsl()
         if result and result.get("token"):
@@ -102,11 +102,8 @@ def extract_cookies_from_browser():
 
 
 def _extract_firefox_wsl():
-    """WSL: read Qwen cookies from Windows Firefox cookies.sqlite via SQLite."""
     import sqlite3
     import shutil
-
-    # Find Firefox profile on Windows filesystem
     firefox_base = Path("/mnt/c/Users")
     profiles = []
     try:
@@ -120,7 +117,6 @@ def _extract_firefox_wsl():
                         profiles.append(p / "cookies.sqlite")
     except PermissionError:
         pass
-
     for sqlite_path in profiles:
         try:
             tmp = Path("/tmp/qwen_cookies.sqlite")
@@ -134,204 +130,123 @@ def _extract_firefox_wsl():
             rows = cur.fetchall()
             conn.close()
             tmp.unlink(missing_ok=True)
-
             result = {}
             for name, value in rows:
                 result[name] = value
             if result.get("token"):
-                log(f"Cookies extracted from Firefox (WSL, {sqlite_path.parent.name})")
+                info(f"Cookies extracted from Firefox (WSL, {sqlite_path.parent.name})")
                 return result
         except Exception:
             continue
-
     return None
 
 
 def import_cookies_from_json(json_path: str):
-    """Import cookies from a JSON file exported by a browser extension.
-
-    The JSON file should be an array of cookie objects with 'name' and 'value'
-    fields (e.g., exported by 'Cookie Editor' or 'EditThisCookie' extensions).
-    """
     p = Path(json_path)
     if not p.exists():
         fail("no-file", f"File not found: {json_path}")
-
     try:
         cookies = json.loads(p.read_text())
     except json.JSONDecodeError as e:
         fail("bad-json", f"Invalid JSON: {e}")
-
     if not isinstance(cookies, list):
         fail("bad-format", f"Expected array of cookies, got {type(cookies).__name__}")
-
-    # Filter for qwen.ai cookies
-    qwen_cookies = [
-        c for c in cookies
-        if isinstance(c, dict) and "qwen.ai" in str(c.get("domain", ""))
-    ]
-
+    qwen_cookies = [c for c in cookies if isinstance(c, dict) and "qwen.ai" in str(c.get("domain", ""))]
     if not qwen_cookies:
         fail("no-qwen-cookies", "No qwen.ai cookies found in file")
-
-    # Extract required cookies
-    token = None
-    lswusea = None
-    cnaui = None
+    token = lswusea = cnaui = None
     for c in qwen_cookies:
         name = c.get("name", "")
         value = c.get("value", "")
-        if name == "token":
-            token = value
-        elif name == "lswusea":
-            lswusea = value
-        elif name == "cnaui":
-            cnaui = value
-
+        if name == "token": token = value
+        elif name == "lswusea": lswusea = value
+        elif name == "cnaui": cnaui = value
     if not token:
-        fail("no-token", "No 'token' cookie found in qwen.ai cookies")
-
-    # Validate JWT format
+        fail("no-token", "No 'token' cookie found")
     if not re.match(r'^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$', token):
-        log("Warning: token doesn't look like a JWT (may still work)")
-
+        info("Warning: token doesn't look like a JWT")
     cookie_parts = [f"token={token}"]
-    if lswusea:
-        cookie_parts.append(f"lswusea={lswusea}")
-    if cnaui:
-        cookie_parts.append(f"cnaui={cnaui}")
-
+    if lswusea: cookie_parts.append(f"lswusea={lswusea}")
+    if cnaui: cookie_parts.append(f"cnaui={cnaui}")
     auth_data = {
-        "token": token,
-        "cookie_header": "; ".join(cookie_parts),
-        "lswusea": lswusea,
-        "cnaui": cnaui,
+        "token": token, "cookie_header": "; ".join(cookie_parts),
+        "lswusea": lswusea, "cnaui": cnaui,
         "saved_at": datetime.now(timezone.utc).isoformat(),
     }
     write_auth(auth_data)
-    log(f"Imported cookies: token present, lswusea={'yes' if lswusea else 'no'}, cnaui={'yes' if cnaui else 'no'}")
-    print(json.dumps({"ok": True, "msg": "Cookies imported and saved to ~/.qwen-cli/auth.json"}, ensure_ascii=False))
+    info(f"Imported cookies: token present")
+    print(json.dumps({"ok": True, "msg": "Cookies imported"}, ensure_ascii=False))
+
 
 def browser_login():
-    """Open visible browser for Qwen login, poll for cookies, save auth."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         fail("no-playwright", "pip install playwright && python -m playwright install chromium")
-
-    log("Launching browser for Qwen login...")
-    log("Log in at chat.qwen.ai, then close the browser window.")
-
+    info("Launching browser for Qwen login...")
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
-            str(QWEN_BROWSER_PROFILE),
-            headless=False,
+            str(QWEN_BROWSER_PROFILE), headless=False,
             viewport={"width": 1280, "height": 800},
-            args=[
-                "--no-sandbox",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox", "--disable-gpu", "--disable-blink-features=AutomationControlled"],
         )
         page = context.pages[0] if context.pages else context.new_page()
         page.goto("https://chat.qwen.ai/", wait_until="domcontentloaded")
-
-        log("Waiting for login (detecting JWT token cookie)...")
-        timeout = 300  # 5 minutes
-        for i in range(timeout):
+        info("Waiting for login...")
+        for i in range(300):
             cookies = context.cookies()
-            token_cookie = None
-            lswusea_cookie = None
-            cnaui_cookie = None
+            token_cookie = lswusea_cookie = cnaui_cookie = None
             for c in cookies:
-                if c["name"] == "token":
-                    token_cookie = c["value"]
-                elif c["name"] == "lswusea":
-                    lswusea_cookie = c["value"]
-                elif c["name"] == "cnaui":
-                    cnaui_cookie = c["value"]
-
+                if c["name"] == "token": token_cookie = c["value"]
+                elif c["name"] == "lswusea": lswusea_cookie = c["value"]
+                elif c["name"] == "cnaui": cnaui_cookie = c["value"]
             if token_cookie:
-                # Build cookie header for later use
                 cookie_parts = [f"token={token_cookie}"]
-                if lswusea_cookie:
-                    cookie_parts.append(f"lswusea={lswusea_cookie}")
-                if cnaui_cookie:
-                    cookie_parts.append(f"cnaui={cnaui_cookie}")
-
+                if lswusea_cookie: cookie_parts.append(f"lswusea={lswusea_cookie}")
+                if cnaui_cookie: cookie_parts.append(f"cnaui={cnaui_cookie}")
                 auth_data = {
-                    "token": token_cookie,
-                    "cookie_header": "; ".join(cookie_parts),
-                    "lswusea": lswusea_cookie,
-                    "cnaui": cnaui_cookie,
+                    "token": token_cookie, "cookie_header": "; ".join(cookie_parts),
+                    "lswusea": lswusea_cookie, "cnaui": cnaui_cookie,
                     "saved_at": datetime.now(timezone.utc).isoformat(),
                 }
                 write_auth(auth_data)
-                log("Login successful! Auth saved to ~/.qwen-cli/auth.json")
+                info("Login successful!")
                 context.close()
                 return auth_data
-
             if i % 30 == 0 and i > 0:
-                elapsed = i
-                log(f"Still waiting for login... ({elapsed}s)")
-
+                info(f"Still waiting... ({i}s)")
             time.sleep(1)
-
         context.close()
         fail("login-timeout", "Login not detected within 5 minutes.")
 
 
 def get_auth():
-    """Get auth from env vars, saved file, or browser cookies."""
-    # Env vars (highest priority)
     token = os.environ.get("QWEN_TOKEN")
     cookie_header = os.environ.get("QWEN_COOKIE_HEADER")
     if token and cookie_header:
         return {"token": token, "cookie_header": cookie_header}
-
     if token:
-        # Build minimal cookie header
         ch = f"token={token}"
         lsw = os.environ.get("QWEN_LSWUSEA")
-        if lsw:
-            ch += f"; lswusea={lsw}"
+        if lsw: ch += f"; lswusea={lsw}"
         return {"token": token, "cookie_header": ch}
-
-    # Saved auth file
     auth = read_auth()
     if auth and auth.get("token") and auth.get("cookie_header"):
         return auth
-
-    # Try browser cookie extraction
     browser_auth = extract_cookies_from_browser()
     if browser_auth and browser_auth.get("token"):
         cookie_parts = [f"token={browser_auth['token']}"]
-        if browser_auth.get("lswusea"):
-            cookie_parts.append(f"lswusea={browser_auth['lswusea']}")
-        if browser_auth.get("cnaui"):
-            cookie_parts.append(f"cnaui={browser_auth['cnaui']}")
-        result = {
-            "token": browser_auth["token"],
-            "cookie_header": "; ".join(cookie_parts),
-            "lswusea": browser_auth.get("lswusea"),
-            "cnaui": browser_auth.get("cnaui"),
-        }
+        if browser_auth.get("lswusea"): cookie_parts.append(f"lswusea={browser_auth['lswusea']}")
+        if browser_auth.get("cnaui"): cookie_parts.append(f"cnaui={browser_auth['cnaui']}")
+        result = {"token": browser_auth["token"], "cookie_header": "; ".join(cookie_parts)}
         write_auth(result)
         return result
+    fail("no-auth", "No Qwen auth found. Log into https://chat.qwen.ai in Windows Firefox first.")
 
-    fail("no-auth",
-         "No Qwen auth found.\n"
-         "Options:\n"
-         "  1. python qwen.py -l              (browser login)\n"
-         "  2. python qwen.py --import-cookies cookies.json  (import from extension)\n"
-         "  3. export QWEN_TOKEN=<jwt> QWEN_COOKIE_HEADER='token=...; lswusea=...'\n"
-         "WSL users: log into chat.qwen.ai in Windows Firefox first, then retry.\n"
-         "Or export cookies from Chrome using 'Cookie Editor' extension and --import-cookies.")
 
 # ── conversation state ───────────────────────────────────
 
 def load_conversation(path: str) -> dict:
-    """Load conversation file. Returns {chat_id, parent_id, history, model}."""
     p = Path(path)
     if p.exists():
         try:
@@ -345,6 +260,383 @@ def save_conversation(path: str, state: dict):
     Path(path).write_text(json.dumps(state, indent=2, ensure_ascii=False))
 
 
+# ── JS-based extraction ──────────────────────────────────
+
+EXTRACT_JS = """
+() => {
+    const selectors = [
+        '[class*="assistant"] [class*="content"]',
+        '[class*="message"][class*="bot"] [class*="text"]',
+        '[data-role="assistant"]',
+        '.chat-bubble:last-child .message-content',
+        '.message-row.bot .message-text',
+    ];
+    for (const sel of selectors) {
+        const els = document.querySelectorAll(sel);
+        if (els.length > 0) {
+            const text = Array.from(els).map(e => e.innerText.trim()).filter(t => t).join('\\n\\n');
+            const cleaned = text
+                .replace(/^Thinking completed\\n*/g, '')
+                .replace(/^Thinking\\.\\.\\.?\\n*/g, '')
+                .replace(/^深度思考完成\\n*/g, '')
+                .trim();
+            if (cleaned) return cleaned;
+        }
+    }
+    const allText = document.body.innerText;
+    const thinkIdx = allText.indexOf('Thinking completed');
+    if (thinkIdx >= 0) {
+        const after = allText.slice(thinkIdx + 'Thinking completed'.length).trim();
+        const lines = after.split('\\n').filter(l => {
+            const s = l.trim();
+            if (!s) return false;
+            if (['Auto', 'Skip', 'AI-generated', 'AI generated content'].includes(s)) return false;
+            if (s.startsWith('Qwen') && s.length < 20) return false;
+            return true;
+        });
+        return lines.join('\\n');
+    }
+    return '';
+}
+"""
+
+EXTRACT_IMAGES_JS = """
+() => {
+    // Find all images in the last assistant message
+    const selectors = [
+        '[class*="assistant"] img',
+        '[class*="message"][class*="bot"] img',
+        '[data-role="assistant"] img',
+    ];
+    for (const sel of selectors) {
+        const imgs = document.querySelectorAll(sel);
+        if (imgs.length > 0) {
+            return Array.from(imgs).map(img => ({
+                src: img.src,
+                alt: img.alt || '',
+                width: img.naturalWidth || img.width || 0,
+                height: img.naturalHeight || img.height || 0,
+            })).filter(i => i.src && !i.src.includes('favicon') && !i.src.includes('logo'));
+        }
+    }
+    // Fallback: all large images in the page that appeared recently
+    const allImgs = document.querySelectorAll('img');
+    const results = [];
+    for (const img of allImgs) {
+        const w = img.naturalWidth || img.width || 0;
+        const h = img.naturalHeight || img.height || 0;
+        if (w > 100 && h > 100 && img.src && !img.src.includes('favicon') && !img.src.includes('logo')) {
+            // Check if this img is inside or near a chat message
+            let parent = img.parentElement;
+            let inChat = false;
+            for (let i = 0; i < 10; i++) {
+                if (!parent) break;
+                const cls = parent.className || '';
+                if (cls.includes('message') || cls.includes('chat') || cls.includes('assistant') || cls.includes('bot') || cls.includes('bubble') || cls.includes('content')) {
+                    inChat = true;
+                    break;
+                }
+                parent = parent.parentElement;
+            }
+            if (inChat) {
+                results.push({src: img.src, alt: img.alt || '', width: w, height: h});
+            }
+        }
+    }
+    return results;
+}
+"""
+
+DONE_JS = """
+() => {
+    const body = document.body.innerText;
+    if (body.includes('Thinking completed')) return true;
+    // Image generation: check if images appeared in assistant message
+    const imgs = document.querySelectorAll('[class*="assistant"] img, [class*="message"][class*="bot"] img');
+    for (const img of imgs) {
+        if (img.naturalWidth > 100 && img.naturalHeight > 100) return true;
+    }
+    return false;
+}
+"""
+
+ERROR_JS = """
+() => {
+    const body = document.body.innerText;
+    if (body.includes('Something went wrong') || body.includes('try again')) return 'error';
+    if (body.includes('Login') && body.includes('expired')) return 'auth-expired';
+    return null;
+}
+"""
+
+
+def extract_response(page, prompt: str, debug: bool = False) -> tuple[str, str | None, list]:
+    """Poll for response completion. Returns (text, chat_id, images)."""
+    response_text = ""
+    chat_id = None
+    images = []
+    deadline = time.time() + 300  # 5 min (image gen can be slow)
+    thinking_seen = False
+
+    while time.time() < deadline:
+        if not chat_id:
+            m = re.search(r'/c/([a-f0-9-]{20,})', page.url)
+            if m:
+                chat_id = m.group(1)
+                if debug:
+                    info(f"Chat ID: {chat_id}")
+
+        # Error check
+        try:
+            err = page.evaluate(ERROR_JS)
+            if err == "auth-expired":
+                fail("auth-expired", "Qwen login expired.")
+            elif err == "error":
+                fail("qwen-error", "Qwen returned an error.")
+        except Exception:
+            pass
+
+        # Check thinking
+        try:
+            done = page.evaluate(DONE_JS)
+        except Exception:
+            done = False
+
+        if done and not thinking_seen:
+            thinking_seen = True
+            log("[QWEN:THINKING]")
+
+        if done:
+            try:
+                text = page.evaluate(EXTRACT_JS)
+            except Exception:
+                text = ""
+                body = page.locator("body").inner_text()
+                if prompt in body:
+                    after = body[body.find(prompt) + len(prompt):]
+                    if "Thinking completed" in after:
+                        final = after.split("Thinking completed", 1)[1].strip()
+                        lines = final.split("\n")
+                        answer_lines = []
+                        for line in lines:
+                            s = line.strip()
+                            if not s: continue
+                            if s in ("Auto", "Skip") or s.startswith("Qwen") or s.startswith("AI-generated"):
+                                continue
+                            answer_lines.append(s)
+                        text = "\n".join(answer_lines).strip()
+
+            # Also extract any images generated in the response
+            try:
+                extracted = page.evaluate(EXTRACT_IMAGES_JS)
+                if extracted:
+                    images = extracted
+            except Exception:
+                pass
+
+            if text and len(text) > 1:
+                for prefix in ["Qwen3.7-Plus", "Qwen3-Max", "Qwen3-Coder"]:
+                    if text.startswith(prefix):
+                        text = text[len(prefix):].strip()
+                if text:
+                    response_text = text
+                    break
+
+        time.sleep(0.5)
+
+    return response_text, chat_id, images
+
+
+# ── image download ───────────────────────────────────────
+
+def download_images(page, images: list, output_dir: Path) -> list[str]:
+    """Download images from URLs using the page's cookies/context. Returns list of local paths."""
+    saved = []
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, img in enumerate(images):
+        src = img.get("src", "")
+        if not src:
+            continue
+        try:
+            # Use fetch in the browser context to get the image (bypasses CORS)
+            img_data_js = """
+            async (url) => {
+                try {
+                    const resp = await fetch(url);
+                    if (!resp.ok) return null;
+                    const blob = await resp.blob();
+                    return new Promise((resolve) => {
+                        const reader = new FileReader();
+                        reader.onloadend = () => resolve({
+                            mime: blob.type,
+                            data: reader.result.split(',')[1]
+                        });
+                        reader.readAsDataURL(blob);
+                    });
+                } catch(e) { return null; }
+            }
+            """
+            result = page.evaluate(img_data_js, src)
+            if result and result.get("data"):
+                ext = result.get("mime", "image/png").split("/")[-1]
+                if ext == "jpeg": ext = "jpg"
+                local_path = output_dir / f"qwen_img_{i+1}.{ext}"
+                local_path.write_bytes(base64.b64decode(result["data"]))
+                saved.append(str(local_path))
+                log(f"[QWEN:IMG] {local_path.name}")
+        except Exception as e:
+            info(f"Failed to download image {i}: {e}")
+
+    return saved
+
+
+# ── browser helpers ───────────────────────────────────────
+
+def setup_cookies(context, auth: dict):
+    cookies_to_set = []
+    for cookie_str in auth["cookie_header"].split("; "):
+        if "=" in cookie_str:
+            name, _, value = cookie_str.partition("=")
+            cookies_to_set.append({
+                "name": name, "value": value,
+                "domain": ".qwen.ai", "path": "/",
+                "httpOnly": name == "token", "secure": True, "sameSite": "Lax",
+            })
+    context.add_cookies(cookies_to_set)
+
+
+def switch_model(page, model: str):
+    """Click the model selector dropdown and choose the specified model."""
+    if model == QWEN_DEFAULT_MODEL:
+        return
+
+    log(f"[QWEN:MODEL] {model}")
+
+    model_selectors = [
+        '[class*="model-selector"]',
+        '[class*="model"] button',
+        'button:has-text("Qwen")',
+        '.model-switch',
+    ]
+    for sel in model_selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0 and btn.is_visible():
+                btn.click()
+                time.sleep(1)
+                break
+        except Exception:
+            continue
+
+    model_option_selectors = [
+        f'[role="option"]:has-text("{model}")',
+        f'li:has-text("{model}")',
+        f'div:has-text("{model}")',
+    ]
+    for sel in model_option_selectors:
+        try:
+            opt = page.locator(sel).first
+            if opt.count() > 0 and opt.is_visible():
+                opt.click()
+                time.sleep(1)
+                info(f"Switched model to {model}")
+                return
+        except Exception:
+            continue
+
+    info(f"Could not find {model} in dropdown — using default model")
+
+
+def upload_image_to_page(page, image_path: str):
+    img_path = Path(image_path)
+    if not img_path.exists():
+        fail("no-image", f"Image not found: {image_path}")
+
+    log("[QWEN:UPLOAD]")
+
+    # Qwen uses a hidden file input #filesUpload triggered by an upload button.
+    # Set files directly on the hidden input (Playwright supports this).
+    fi = page.locator("#filesUpload")
+    if fi.count() == 0:
+        # Fallback: try generic file input
+        fi = page.locator('input[type="file"]').first
+
+    if fi.count() > 0:
+        fi.set_input_files(str(img_path))
+        time.sleep(2)  # wait for upload to complete
+        return
+
+    # Last resort: try file chooser dialog via clicking upload triggers
+    trigger_selectors = [
+        'button[aria-label*="upload" i]',
+        'button[aria-label*="attach" i]',
+        '[class*="upload"] button',
+        '[class*="attach"] button',
+        'label[for="filesUpload"]',
+    ]
+    for sel in trigger_selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.count() > 0 and btn.is_visible():
+                with page.expect_file_chooser() as fc_info:
+                    btn.click()
+                fc_info.value.set_files(str(img_path))
+                time.sleep(2)
+                return
+        except Exception:
+            continue
+
+    fail("no-upload", "Could not find image upload element on Qwen page.")
+
+
+def send_prompt(page, prompt: str, chat_id: str | None = None,
+                model: str = QWEN_DEFAULT_MODEL,
+                image: str = "", extract_images_dir: str = "",
+                debug: bool = False):
+    """Navigate to Qwen, type prompt, optionally upload image, wait for response."""
+    log("[QWEN:LOADING]")
+
+    # Navigate
+    if chat_id:
+        page.goto(f"{QWEN_BASE_URL}/c/{chat_id}", wait_until="domcontentloaded", timeout=30000)
+    else:
+        page.goto(QWEN_BASE_URL, wait_until="domcontentloaded", timeout=30000)
+    time.sleep(2)
+
+    # Switch model if not default
+    if model != QWEN_DEFAULT_MODEL:
+        switch_model(page, model)
+
+    # Upload image if provided
+    if image:
+        upload_image_to_page(page, image)
+
+    # Find textarea
+    textbox = page.locator("textarea").first
+    if not textbox.is_visible(timeout=5000):
+        fail("no-input", "Could not find chat input. Auth may have expired.")
+
+    if debug:
+        info(f"Sending prompt ({len(prompt)} chars)")
+
+    textbox.fill(prompt)
+    time.sleep(0.3)
+    textbox.press("Enter")
+
+    if debug:
+        info("Waiting for response...")
+
+    response_text, new_chat_id, images = extract_response(page, prompt, debug=debug)
+
+    # Download generated images if requested
+    saved_images = []
+    if extract_images_dir and images:
+        saved_images = download_images(page, images, Path(extract_images_dir))
+
+    return response_text, new_chat_id, saved_images
+
+
 # ── main CLI ─────────────────────────────────────────────
 
 def main():
@@ -353,17 +645,13 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
         Examples:
-          python qwen.py -l                          # Login via browser
-          python qwen.py --import-cookies cookies.json  # Import from browser extension
-          python qwen.py "Hello"                     # Text prompt
-          python qwen.py -m qwen3-max "Complex task" # Model selection
-          python qwen.py -c chat.json "Message"      # Multi-turn conversation
-          python qwen.py --json "prompt"             # JSON output
-          python qwen.py -o result.md "prompt"       # Write to file
-          echo "prompt" | python qwen.py             # Stdin
+          python qwen.py "Hello"
+          python qwen.py -m qwen3-max "Complex task"
+          python qwen.py --image photo.jpg "Describe this image"
+          python qwen.py --extract-images /tmp/imgs "Generate a cat"
+          python qwen.py -c chat.json "Multi-turn message"
         """),
     )
-
     parser.add_argument("prompt", nargs="*", help="Prompt text (or pipe via stdin)")
     parser.add_argument("-p", "--prompt-flag", help="Prompt via flag")
     parser.add_argument("-m", "--model", default=QWEN_DEFAULT_MODEL,
@@ -373,28 +661,28 @@ def main():
     parser.add_argument("-o", "--output", help="Write response to file")
     parser.add_argument("--json", action="store_true", help="JSON output on stdout")
     parser.add_argument("-l", "--login", action="store_true", help="Browser login flow")
-    parser.add_argument("--import-cookies", metavar="FILE",
-                        help="Import cookies from JSON file (browser extension export)")
-    parser.add_argument("--brief", action="store_true", help="Concise mode")
+    parser.add_argument("--import-cookies", metavar="FILE", help="Import cookies from JSON")
     parser.add_argument("--no-thinking", action="store_true", help="Disable thinking")
     parser.add_argument("--no-search", action="store_true", help="Disable web search")
+    parser.add_argument("--image", metavar="FILE", help="Image file to upload for analysis")
+    parser.add_argument("--extract-images", metavar="DIR",
+                        help="Download images generated by Qwen to this directory")
+    parser.add_argument("--persist", action="store_true", help="Use persistent browser profile")
     parser.add_argument("--debug", action="store_true", help="Debug output")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress stderr logs")
 
     args = parser.parse_args()
 
-    # ── login mode ──
     if args.login:
-        auth = browser_login()
-        print(json.dumps({"ok": True, "msg": "Login saved to ~/.qwen-cli/auth.json"}, ensure_ascii=False))
+        browser_login()
+        print(json.dumps({"ok": True, "msg": "Login saved"}, ensure_ascii=False))
         return
 
-    # ── cookie import mode ──
     if args.import_cookies:
         import_cookies_from_json(args.import_cookies)
         return
 
-    # ── resolve prompt ──
+    # Resolve prompt
     prompt = None
     if args.prompt_flag:
         prompt = args.prompt_flag
@@ -402,16 +690,11 @@ def main():
         prompt = " ".join(args.prompt)
     elif not sys.stdin.isatty():
         prompt = sys.stdin.read().strip()
-
     if not prompt:
         parser.print_help()
-        print("\nError: No prompt provided. Use positional args, -p, or stdin.")
         sys.exit(1)
 
-    # ── model ──
     model = args.model
-
-    # ── conversation ──
     conv = {}
     chat_id = None
     if args.conversation:
@@ -420,111 +703,57 @@ def main():
             conv = {}
     chat_id = conv.get("chat_id")
     if conv.get("model"):
-        model = conv["model"]  # use saved model from conversation
+        model = conv["model"]
 
-    # ── auth ──
     auth = get_auth()
-
-    # ── send ──
-    thinking = not args.no_thinking
-    search = not args.no_search
 
     try:
         from playwright.sync_api import sync_playwright
 
         with sync_playwright() as p:
-            # Use simple launch (not persistent) to avoid EPIPE driver bug
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-gpu"],
-            )
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 800},
-            )
-
-            # Inject cookies
-            cookies_to_set = []
-            for cookie_str in auth["cookie_header"].split("; "):
-                if "=" in cookie_str:
-                    name, _, value = cookie_str.partition("=")
-                    cookies_to_set.append({
-                        "name": name, "value": value,
-                        "domain": ".qwen.ai", "path": "/",
-                        "httpOnly": name == "token", "secure": True, "sameSite": "Lax",
-                    })
-            context.add_cookies(cookies_to_set)
-
-            page = context.new_page()
-
-            # Navigate to existing chat or new
-            if chat_id:
-                page.goto(f"{QWEN_BASE_URL}/c/{chat_id}", wait_until="domcontentloaded", timeout=30000)
+            if args.persist:
+                profile_dir = str(QWEN_BROWSER_PROFILE)
+                QWEN_HOME.mkdir(parents=True, exist_ok=True)
+                context = p.chromium.launch_persistent_context(
+                    profile_dir, headless=True,
+                    viewport={"width": 1280, "height": 800},
+                    args=["--no-sandbox", "--disable-gpu"],
+                )
             else:
-                page.goto(QWEN_BASE_URL, wait_until="domcontentloaded", timeout=30000)
-            time.sleep(3)
+                browser = p.chromium.launch(
+                    headless=True, args=["--no-sandbox", "--disable-gpu"],
+                )
+                context = browser.new_context(viewport={"width": 1280, "height": 800})
 
-            # Find and fill textbox
-            textbox = page.locator("textarea").first
-            if not textbox.is_visible(timeout=5000):
-                fail("no-input", "Could not find chat input. Auth may have expired.")
+            setup_cookies(context, auth)
+            page = context.pages[0] if context.pages else context.new_page()
 
-            if args.debug:
-                log(f"Sending prompt ({len(prompt)} chars)")
+            response_text, new_chat_id, saved_images = send_prompt(
+                page, prompt, chat_id=chat_id,
+                model=model,
+                image=args.image,
+                extract_images_dir=args.extract_images,
+                debug=args.debug,
+            )
 
-            textbox.fill(prompt)
-            time.sleep(0.3)
-            textbox.press("Enter")
-
-            if args.debug:
-                log("Waiting for response...")
-
-            # Extract chat_id and wait for response
-            response_text = ""
-            deadline = time.time() + 180
-
-            while time.time() < deadline:
-                # Extract chat_id from URL once Qwen navigates to it
-                if not chat_id:
-                    m = re.search(r'/c/([a-f0-9-]{20,})', page.url)
-                    if m:
-                        chat_id = m.group(1)
-
-                body = page.locator("body").inner_text()
-                if prompt in body:
-                    after_prompt = body[body.find(prompt) + len(prompt):]
-
-                    # Wait for "Thinking completed" then extract final answer
-                    if "Thinking completed" in after_prompt:
-                        final = after_prompt.split("Thinking completed", 1)[1].strip()
-                        # Take text until we hit UI chrome (Auto, Qwen, AI-generated, Skip)
-                        lines = final.split("\n")
-                        answer_lines = []
-                        for line in lines:
-                            s = line.strip()
-                            if not s:
-                                continue
-                            if s in ("Auto", "Skip", "Qwen3.7-Plus") or \
-                               s.startswith("Qwen") or s.startswith("AI-generated"):
-                                continue
-                            answer_lines.append(s)
-                        answer = "\n".join(answer_lines).strip()
-                        if answer and len(answer) > 1:
-                            response_text = answer
-                            break
-                time.sleep(1)
-
-            browser.close()
+            if not args.persist:
+                context.close()
+                if 'browser' in dir():
+                    browser.close()
+            else:
+                context.close()
 
             if not response_text:
                 fail("empty-response", "No response received. Auth may have expired.")
 
-            # ── update conversation ──
+            log("[QWEN:DONE]")
+
             if args.conversation:
-                conv["chat_id"] = chat_id
+                conv["chat_id"] = new_chat_id or chat_id
                 conv["model"] = model
                 save_conversation(args.conversation, conv)
 
-            # ── output ──
+            # Output
             if args.output:
                 out_path = Path(args.output)
                 out_path.write_text(response_text, encoding="utf-8")
@@ -537,15 +766,20 @@ def main():
                     "b": code_blocks // 2,
                 }
                 if args.conversation:
-                    result["c"] = chat_id
+                    result["c"] = new_chat_id or chat_id
+                if saved_images:
+                    result["img"] = saved_images
                 print(json.dumps(result, ensure_ascii=False))
             elif args.json:
-                print(json.dumps({
+                out = {
                     "ok": True,
                     "text": response_text,
-                    "chat_id": chat_id,
+                    "chat_id": new_chat_id or chat_id,
                     "model": model,
-                }, ensure_ascii=False))
+                }
+                if saved_images:
+                    out["images"] = saved_images
+                print(json.dumps(out, ensure_ascii=False))
             else:
                 print(response_text)
 

@@ -1,6 +1,6 @@
 ---
 name: qwen-web-cli
-description: CLI for Qwen Chat (chat.qwen.ai) via Playwright browser automation. Auth via browser cookies, uses headless Chromium to interact with the chat UI (Alibaba WAF blocks direct API calls).
+description: CLI plus native Hermes tool for Qwen Chat via Playwright browser. Text-only model (Qwen3.7). 16-25s latency. Token-efficient JSON pointer output.
 triggers:
   keywords:
     - Qwen
@@ -9,88 +9,84 @@ triggers:
     - chat.qwen.ai
   context:
     - User wants to use Qwen Chat from CLI
-    - User needs browser-cookie auth for Qwen
-    - User wants Qwen for reasoning/coding tasks
+    - User needs free alternative model
+    - User wants cross-model collaboration with Qwen
 ---
 
-# qwen-web-cli
+# qwen-web-cli v2
 
 Browser-automation CLI for Qwen Chat (chat.qwen.ai). Uses headless Chromium via Playwright to type into the Qwen web UI and extract responses — Alibaba's WAF + request signing makes direct HTTP API calls impossible.
 
-Script: `/home/peter/.hermes/scripts/qwen/qwen.py`
-Python: `/home/peter/.hermes/hermes-agent/.venv/bin/python3`
+Script: `qwen.py`
+Python: `python3`
 
 ## Quick Reference
 
 ```bash
-QWEN=/home/peter/.hermes/scripts/qwen/qwen.py
-PY=/home/peter/.hermes/hermes-agent/.venv/bin/python3
+# Agent-optimized output (15-token pointer, response on disk) — ALWAYS USE THIS
+python qwen.py --no-thinking -o result.md "your prompt"
 
-# Text prompt
-$PY $QWEN "Explain quantum computing in 3 bullet points"
+# JSON output — use when you need structured output
+python qwen.py --no-thinking --json "your prompt"
 
-# JSON output
-$PY $QWEN --json "What is 2+2?"
+# Multi-turn conversations (uses Qwen account-level memory)
+python qwen.py -c chat.json "My name is Peter"
+python qwen.py -c chat.json "What is my name?"
 
-# Agent-optimized output (15-token pointer, response on disk)
-$PY $QWEN -o result.md "Write a haiku about code"
+# Background execution with progress markers
+python qwen.py --no-thinking -o out.md "prompt" 2>progress.log
 
-# Multi-turn conversations
-$PY $QWEN -c chat.json "My name is Peter"
-$PY $QWEN -c chat.json "What is my name?"
-
-# Start fresh conversation
-$PY $QWEN -c chat.json --new "New topic"
-
-# Stdin
-echo "Hello" | $PY $QWEN
-
-# Login via browser
-$PY $QWEN -l
-
-# Import cookies from browser extension JSON export
-$PY $QWEN --import-cookies cookies.json
+# Pipe from stdin
+echo "prompt" | python qwen.py
 ```
 
 ## Flags
 
 | Flag | Purpose |
 |------|---------|
-| `-m MODEL` | Model name (default: qwen3.7-plus) |
+| `-m MODEL` | Model name (qwen3.7-plus, qwen3-max, qwen3-coder) |
 | `-c FILE` | Multi-turn conversation state file |
 | `--new` | Start fresh with `-c` |
-| `-o FILE` | Write response to file (agent-optimized) |
+| `-o FILE` | Write response to file (agent-optimized, ~50-char stdout pointer) |
 | `--json` | JSON output on stdout |
-| `-l` / `--login` | Browser login flow |
-| `--import-cookies FILE` | Import cookies from JSON export |
-| `--no-thinking` | Disable thinking mode |
+| `--no-thinking` | Disable thinking (saves ~10s) |
 | `--no-search` | Disable web search |
+| `--image FILE` | Image file to upload for analysis |
+| `--extract-images DIR` | Save generated images to directory |
+| `--persist` | Use persistent browser profile |
 | `--debug` | Debug output |
+
+## Capability Matrix
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Text prompts | ✅ WORKS | 16-25s latency |
+| Multi-turn | ⚠️ PARTIAL | Qwen account memory works. chat_id deep-linking broken |
+| Model switching | ⚠️ PARTIAL | Flag plumbed, UI selector not confirmed |
+| Image upload | ⚠️ UNRELIABLE | #filesUpload hidden input exists, set_input_files fails |
+| Image generation | ❌ NOT SUPPORTED | Qwen 3.7 is text-only. Tongyi Wanxiang is separate |
+| Progress markers | ✅ WORKS | [QWEN:LOADING/THINKING/DONE] on stderr |
 
 ## Auth
 
-**WSL (this environment):** Auto-extracts cookies from Windows Firefox cookies.sqlite.
-Just log into https://chat.qwen.ai in Firefox first, then the CLI finds your session.
+**WSL (this environment):** Auto-extracts from Windows Firefox cookies via SQLite.
+Log into https://chat.qwen.ai in Windows Firefox first. Cached at `~/.qwen-cli/auth.json`.
 
 Other auth methods:
 1. `python qwen.py -l` — opens visible browser for login
-2. `python qwen.py --import-cookies cookies.json` — import from Chrome extension export
-3. `export QWEN_TOKEN=<jwt> QWEN_COOKIE_HEADER='token=...; cnaui=...'` — manual env vars
-
-Cookies are cached at `~/.qwen-cli/auth.json` after first extraction.
+2. `python qwen.py --import-cookies cookies.json` — import from Chrome extension
+3. `export QWEN_TOKEN=*** QWEN_COOKIE_HEADER='token=...; cnaui=...'` — manual env vars
 
 ## Architecture
 
-Qwen Chat uses Alibaba WAF (Web Application Firewall) + JS/WASM-based request signing (`bx-ua` header). Direct HTTP requests — even with valid cookies — are blocked with a challenge page.
+Qwen Chat uses Alibaba WAF + JS/WASM request signing (`bx-ua` header) that blocks direct API calls. Browser automation is the only path:
 
-Instead of reverse-engineering the signing, we use browser automation:
 1. Launch headless Chromium via Playwright
-2. Inject auth cookies
+2. Inject auth cookies (token, cnaui, lswusea)
 3. Navigate to chat.qwen.ai
-4. Type the prompt into the chat textarea
-5. Press Enter
-6. Poll body text for "Thinking completed" then extract the final answer
-7. Return clean response text
+4. Type prompt into textarea + press Enter
+5. Poll for completion + extract response via JS DOM evaluation
+6. Return clean text or JSON pointer
 
 ## Output Pointer Format (agent-optimized)
 
@@ -100,19 +96,18 @@ Instead of reverse-engineering the signing, we use browser automation:
 
 | Key | Meaning |
 |-----|---------|
-| `f` | File path (relative when under cwd) |
+| `f` | File path |
 | `s` | Response size in bytes |
 | `b` | Number of code blocks |
 | `c` | Chat ID (with `-c`) |
+| `img` | Downloaded image paths (with `--extract-images`) |
 
 ## Known Limitations
 
-- **~30s latency:** Headless Chromium launch + page load + thinking time = ~30s per query
-- **Thinking mode:** Qwen shows reasoning first. We wait for "Thinking completed" before extracting the answer. Use `--no-thinking` for faster responses.
-- **No streaming:** Response is extracted after completion, not streamed in real-time
-- **Browser dependency:** Requires Playwright (pip install playwright) + Chromium (python -m playwright install chromium)
-
-## Dependencies
-
-- `playwright` — browser automation
-- `browser_cookie3` — cookie extraction (optional, WSL uses SQLite fallback)
+- **16-25s latency** — browser launch + page load + inference
+- **No streaming** — response extracted after completion
+- **No image generation** — Qwen 3.7 is text-only
+- **Image upload unreliable** — upload button not found in authenticated DOM
+- **Model switching partial** — Qwen UI may not expose clickable selector
+- **Auth expiry** — re-login in Firefox when `no-auth` error appears
+- **Browser dependency** — Playwright + Chromium required
