@@ -38,6 +38,25 @@ QWEN_BROWSER_PROFILE = QWEN_HOME / "browser-profile"
 QWEN_BASE_URL = "https://chat.qwen.ai"
 QWEN_DEFAULT_MODEL = "qwen3.7-plus"
 
+# Financial terms that Qwen/Kimi block — fail fast instead of hanging
+_FINANCE_KEYWORDS = [
+    'stock price', 'share price', 'market cap', 'trading at', 'dividend yield',
+    'earnings report', 'quarterly revenue', 'p/e ratio', 'balance sheet',
+    'cash flow statement', 'income statement', 'ebitda', 'eps ', 'pe ratio',
+    'nyse', 'nasdaq', 'ticker', 'etf price', 'index fund', 's&p 500',
+    'dow jones', 'ftse', 'hang seng', 'nikkei', 'stock market',
+]
+_FINANCE_TICKER_RE = re.compile(r'\$[A-Z]{1,5}\b|\b[A-Z]{1,5}\s+(?:stock|share|ticker)\b', re.IGNORECASE)
+
+def _is_finance_query(prompt: str) -> bool:
+    """Detect if a prompt is a financial query that Qwen will block."""
+    pl = prompt.lower()
+    if any(kw in pl for kw in _FINANCE_KEYWORDS):
+        return True
+    if _FINANCE_TICKER_RE.search(prompt):
+        return True
+    return False
+
 # ── helpers ──────────────────────────────────────────────
 
 def fail(code: str, reason: str):
@@ -694,6 +713,12 @@ def main():
         parser.print_help()
         sys.exit(1)
 
+    # Pre-check: Qwen blocks financial queries — fail fast
+    if _is_finance_query(prompt):
+        fail("content-filter",
+            "Qwen blocks financial/stock queries. Use fin-agent-cli for stock data, "
+            "or Gemini/DeepSeek/MiniMax for financial analysis.")
+
     model = args.model
     conv = {}
     chat_id = None
@@ -707,21 +732,25 @@ def main():
 
     auth = get_auth()
 
+    browser = context = page = None
+    pw_instance = None
     try:
         from playwright.sync_api import sync_playwright
 
-        with sync_playwright() as p:
+        pw_instance = sync_playwright().start()
+        try:
             if args.persist:
                 profile_dir = str(QWEN_BROWSER_PROFILE)
                 QWEN_HOME.mkdir(parents=True, exist_ok=True)
-                context = p.chromium.launch_persistent_context(
+                context = pw_instance.chromium.launch_persistent_context(
                     profile_dir, headless=True,
                     viewport={"width": 1280, "height": 800},
-                    args=["--no-sandbox", "--disable-gpu"],
+                    args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
                 )
             else:
-                browser = p.chromium.launch(
-                    headless=True, args=["--no-sandbox", "--disable-gpu"],
+                browser = pw_instance.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
                 )
                 context = browser.new_context(viewport={"width": 1280, "height": 800})
 
@@ -735,53 +764,60 @@ def main():
                 extract_images_dir=args.extract_images,
                 debug=args.debug,
             )
+        finally:
+            # Clean shutdown to avoid Node.js EPIPE crashes
+            if page:
+                try: page.close()
+                except: pass
+            if context:
+                try: context.close()
+                except: pass
+            if browser:
+                try: browser.close()
+                except: pass
+            if pw_instance:
+                try: pw_instance.stop()
+                except: pass
 
-            if not args.persist:
-                context.close()
-                if 'browser' in dir():
-                    browser.close()
-            else:
-                context.close()
+        if not response_text:
+            fail("empty-response", "No response received. Auth may have expired.")
 
-            if not response_text:
-                fail("empty-response", "No response received. Auth may have expired.")
+        log("[QWEN:DONE]")
 
-            log("[QWEN:DONE]")
+        if args.conversation:
+            conv["chat_id"] = new_chat_id or chat_id
+            conv["model"] = model
+            save_conversation(args.conversation, conv)
 
+        # Output
+        if args.output:
+            out_path = Path(args.output)
+            out_path.write_text(response_text, encoding="utf-8")
+            size = out_path.stat().st_size
+            code_blocks = response_text.count("```")
+            result = {
+                "ok": True,
+                "f": str(out_path),
+                "s": size,
+                "b": code_blocks // 2,
+            }
             if args.conversation:
-                conv["chat_id"] = new_chat_id or chat_id
-                conv["model"] = model
-                save_conversation(args.conversation, conv)
-
-            # Output
-            if args.output:
-                out_path = Path(args.output)
-                out_path.write_text(response_text, encoding="utf-8")
-                size = out_path.stat().st_size
-                code_blocks = response_text.count("```")
-                result = {
-                    "ok": True,
-                    "f": str(out_path),
-                    "s": size,
-                    "b": code_blocks // 2,
-                }
-                if args.conversation:
-                    result["c"] = new_chat_id or chat_id
-                if saved_images:
-                    result["img"] = saved_images
-                print(json.dumps(result, ensure_ascii=False))
-            elif args.json:
-                out = {
-                    "ok": True,
-                    "text": response_text,
-                    "chat_id": new_chat_id or chat_id,
-                    "model": model,
-                }
-                if saved_images:
-                    out["images"] = saved_images
-                print(json.dumps(out, ensure_ascii=False))
-            else:
-                print(response_text)
+                result["c"] = new_chat_id or chat_id
+            if saved_images:
+                result["img"] = saved_images
+            print(json.dumps(result, ensure_ascii=False))
+        elif args.json:
+            out = {
+                "ok": True,
+                "text": response_text,
+                "chat_id": new_chat_id or chat_id,
+                "model": model,
+            }
+            if saved_images:
+                out["images"] = saved_images
+            print(json.dumps(out, ensure_ascii=False))
+        else:
+            print(response_text)
 
     except SystemExit:
         raise
