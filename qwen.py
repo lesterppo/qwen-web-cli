@@ -461,12 +461,9 @@ def extract_response(page, prompt: str, debug: bool = False) -> tuple[str, str |
                     response_text = text
                     break
 
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     return response_text, chat_id, images
-
-
-# ── image download ───────────────────────────────────────
 
 def download_images(page, images: list, output_dir: Path) -> list[str]:
     """Download images from URLs using the page's cookies/context. Returns list of local paths."""
@@ -621,7 +618,12 @@ def send_prompt(page, prompt: str, chat_id: str | None = None,
         page.goto(f"{QWEN_BASE_URL}/c/{chat_id}", wait_until="domcontentloaded", timeout=30000)
     else:
         page.goto(QWEN_BASE_URL, wait_until="domcontentloaded", timeout=30000)
-    time.sleep(2)
+    
+    # Smart wait for textarea instead of fixed sleep
+    try:
+        page.wait_for_selector("textarea", timeout=8000)
+    except Exception:
+        time.sleep(2)
 
     # Switch model if not default
     if model != QWEN_DEFAULT_MODEL:
