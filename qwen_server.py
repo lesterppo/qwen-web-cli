@@ -41,6 +41,17 @@ def init_browser():
         _ctx.add_cookies([{"name": n, "value": v, "domain": ".qwen.ai", "path": "/",
                            "httpOnly": False, "secure": True, "sameSite": "Lax"}])
     _pg = _ctx.pages[0] if _ctx.pages else _ctx.new_page()
+    
+    # Block slow resources
+    try:
+        def _abort(route):
+            if route.request.resource_type in {"image", "font", "media"}:
+                route.abort()
+            else:
+                route.continue_()
+        _pg.route("**/*", _abort)
+    except Exception: pass
+    
     _pg.goto(QWEN_URL, timeout=30000)
     try: _pg.wait_for_selector("textarea", timeout=10000)
     except: time.sleep(3)

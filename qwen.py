@@ -52,7 +52,26 @@ def _qwen_server_running() -> bool:
     except: return False
 
 def _try_qwen_server(prompt: str) -> dict | None:
-    if not _qwen_server_running(): return None
+    if not _qwen_server_running():
+        from pathlib import Path
+        server_script = Path(__file__).resolve().parent / "qwen_server.py"
+        if not server_script.exists():
+            return None
+        import subprocess
+        log_path = Path.home() / ".chrome-daemon" / "qwen_server.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(
+            [sys.executable, str(server_script)],
+            stdout=open(log_path, "a"), stderr=open(log_path, "a"),
+            start_new_session=True,
+        )
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if _qwen_server_running():
+                break
+            time.sleep(0.5)
+        if not _qwen_server_running():
+            return None
     try:
         import urllib.request
         data = json.dumps({"prompt": prompt}).encode()
@@ -752,17 +771,19 @@ def main():
     server_result = _try_qwen_server(prompt)
     if server_result:
         text = server_result.get("text", "")
-        if not text: fail("empty-response", "No response from server.")
-        log("[QWEN:DONE]")
-        if args.conversation:
-            conv["chat_id"] = "server"; conv["model"] = model
-            save_conversation(args.conversation, conv)
-        if args.output:
-            op = Path(args.output); op.write_text(text, encoding="utf-8")
-            print(json.dumps({"f":str(op),"s":op.stat().st_size,"b":text.count("```")//2}, ensure_ascii=False))
-        elif args.json: print(json.dumps({"ok":True,"text":text,"model":model}, ensure_ascii=False))
-        else: print(text)
-        return
+        if text:
+            log("[QWEN:DONE]")
+            if args.conversation:
+                conv["chat_id"] = "server"; conv["model"] = model
+                save_conversation(args.conversation, conv)
+            if args.output:
+                op = Path(args.output); op.write_text(text, encoding="utf-8")
+                print(json.dumps({"f":str(op),"s":op.stat().st_size,"b":text.count("```")//2}, ensure_ascii=False))
+            elif args.json: print(json.dumps({"ok":True,"text":text,"model":model}, ensure_ascii=False))
+            else: print(text)
+            return
+        # Server returned empty — fall through to direct Playwright
+
 
     model = args.model
     conv = {}
