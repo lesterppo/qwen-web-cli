@@ -5,6 +5,9 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from threading import Thread, Lock
 
+# Add scripts dir to path for server_auth
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 QWEN_HOME = Path.home() / ".qwen-cli"
 QWEN_AUTH = QWEN_HOME / "auth.json"
 QWEN_URL = "https://chat.qwen.ai"
@@ -20,13 +23,20 @@ def load_auth():
 def init_browser():
     global _pw, _ctx, _pg
     from playwright.sync_api import sync_playwright
+    from server_auth import refresh_auth
+    
     auth = load_auth()
+    if not auth or not auth.get("cookies"):
+        # Try re-scanning Firefox
+        auth = refresh_auth("%qwen%", ["qwen-auth", "csrf"], QWEN_AUTH, QWEN_HOME / "browser-profile")
+        if not auth:
+            raise RuntimeError("No Qwen auth. Log into chat.qwen.ai in Firefox.")
+    
     profile_dir = str(QWEN_HOME / "browser-profile")
     _pw = sync_playwright().start()
     _ctx = _pw.chromium.launch_persistent_context(profile_dir, headless=True,
         viewport={"width": 1280, "height": 800},
         args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"])
-    # Qwen cookies
     for n, v in auth.get("cookies", {}).items():
         _ctx.add_cookies([{"name": n, "value": v, "domain": ".qwen.ai", "path": "/",
                            "httpOnly": False, "secure": True, "sameSite": "Lax"}])
@@ -34,6 +44,21 @@ def init_browser():
     _pg.goto(QWEN_URL, timeout=30000)
     try: _pg.wait_for_selector("textarea", timeout=10000)
     except: time.sleep(3)
+    
+    # Verify auth didn't expire during init
+    ta = _pg.locator("textarea").first
+    if ta.count() > 0:
+        ph = ta.get_attribute("placeholder") or ""
+        if "sign in" in ph.lower() or "log in" in ph.lower():
+            # Try one more refresh
+            auth2 = refresh_auth("%qwen%", ["qwen-auth", "csrf"], QWEN_AUTH, QWEN_HOME / "browser-profile")
+            if auth2:
+                for n, v in auth2.get("cookies", {}).items():
+                    _ctx.add_cookies([{"name": n, "value": v, "domain": ".qwen.ai", "path": "/",
+                                       "httpOnly": False, "secure": True, "sameSite": "Lax"}])
+                _pg.goto(QWEN_URL, timeout=30000)
+                time.sleep(3)
+    
     print("Qwen server ready", flush=True)
 
 def send_query(prompt: str) -> str:
@@ -97,6 +122,7 @@ def cleanup():
         except: pass
 
 class Handler(BaseHTTPRequestHandler):
+    allow_reuse_address = True
     def do_POST(self):
         if self.path != "/query": self.send_error(404); return
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
