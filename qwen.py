@@ -38,6 +38,32 @@ QWEN_BROWSER_PROFILE = QWEN_HOME / "browser-profile"
 QWEN_BASE_URL = "https://chat.qwen.ai"
 QWEN_DEFAULT_MODEL = "qwen3.7-plus"
 
+# Page server integration
+_QWEN_SERVER_PORT = 9873
+_QWEN_PID_FILE = QWEN_HOME / "server.pid"
+
+def _qwen_server_running() -> bool:
+    if not _QWEN_PID_FILE.exists(): return False
+    try:
+        os.kill(int(_QWEN_PID_FILE.read_text().strip()), 0)
+        import urllib.request
+        urllib.request.urlopen(f"http://127.0.0.1:{_QWEN_SERVER_PORT}/health", timeout=1)
+        return True
+    except: return False
+
+def _try_qwen_server(prompt: str) -> dict | None:
+    if not _qwen_server_running(): return None
+    try:
+        import urllib.request
+        data = json.dumps({"prompt": prompt}).encode()
+        req = urllib.request.Request(f"http://127.0.0.1:{_QWEN_SERVER_PORT}/query",
+                                      data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read())
+            if result.get("ok"): return result
+    except: pass
+    return None
+
 # Financial terms that Qwen/Kimi block — fail fast instead of hanging
 _FINANCE_KEYWORDS = [
     'stock price', 'share price', 'market cap', 'trading at', 'dividend yield',
@@ -720,6 +746,23 @@ def main():
         fail("content-filter",
             "Qwen blocks financial/stock queries. Use fin-agent-cli for stock data, "
             "or Gemini/DeepSeek/MiniMax for financial analysis.")
+
+    # Fast path: try page server first (avoids Node.js v24 EPIPE in subprocess)
+    model = args.model
+    server_result = _try_qwen_server(prompt)
+    if server_result:
+        text = server_result.get("text", "")
+        if not text: fail("empty-response", "No response from server.")
+        log("[QWEN:DONE]")
+        if args.conversation:
+            conv["chat_id"] = "server"; conv["model"] = model
+            save_conversation(args.conversation, conv)
+        if args.output:
+            op = Path(args.output); op.write_text(text, encoding="utf-8")
+            print(json.dumps({"f":str(op),"s":op.stat().st_size,"b":text.count("```")//2}, ensure_ascii=False))
+        elif args.json: print(json.dumps({"ok":True,"text":text,"model":model}, ensure_ascii=False))
+        else: print(text)
+        return
 
     model = args.model
     conv = {}
